@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 privacy-blur = "privacy_blur.cli:main"
+privacy-blur-batch = "privacy_blur.batch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
