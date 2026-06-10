@@ -1,14 +1,18 @@
-import argparse, cv2, sys, time
+import argparse, cv2, time
 from .detectors import PlateDetectorYOLO, FaceDetectorHaar, FaceDetectorYOLO
 from .blur_ops import gaussian_inplace, pixelate_inplace
 from .utils import choose_device, expand_box, nms_merge
 from .writers import make_writer, FFmpegReader
 from .pipeline import ThreadedReader, ThreadedWriter
 
-def main():
-    ap = argparse.ArgumentParser("Blur license plates and/or faces in video")
-    ap.add_argument("--input", required=True, help="video path or camera index, e.g. 0")
-    ap.add_argument("--output", default="out_blurred.mp4", help="output video path")
+
+def add_common_args(ap: argparse.ArgumentParser) -> None:
+    """Register all flags shared by the single-file CLI and the batch CLI.
+
+    The single-file CLI adds `--input`/`--output` on top of these; the batch
+    CLI adds `--work-dir` plus batch-specific flags. Keeping these in one
+    function ensures behavior stays identical between the two entry points.
+    """
     ap.add_argument("--device", default="auto", choices=["auto","cpu","cuda","mps"], help="inference device")
     ap.add_argument("--imgsz", type=int, default=960, help="YOLO inference size")
     ap.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
@@ -42,12 +46,39 @@ def main():
                     help="Disable the threaded pipeline (single-threaded loop). Useful for debugging or to compare against the baseline.")
     ap.add_argument("--queue-size", type=int, default=4,
                     help="Max frames buffered between threads. 2-8 is sensible; higher uses more RAM.")
-    args = ap.parse_args()
 
-    device = choose_device(args.device)
-    print(f"[INFO] Using device: {device}")
 
-    use_ffmpeg_reader = args.reader == "ffmpeg" and not args.input.isdigit()
+def build_detectors(args, device: str):
+    """Construct plate + face detectors from `args`. Returns (plate, face).
+
+    Either may be None when the corresponding `--no-blur-*` flag is set. The
+    batch runner calls this once and passes the result into every
+    `process_video()` invocation so TRT engines aren't reloaded per file.
+    """
+    plate_detector = PlateDetectorYOLO(args.plate_weights, device, args.conf, args.imgsz,
+                                        task=args.plate_task) \
+                 if args.blur_plates else None
+
+    if args.blur_faces:
+        face_detector = FaceDetectorHaar() if args.face_detector=="haar" else FaceDetectorYOLO(
+            args.face_yolo_weights, device, args.conf, args.imgsz, task=args.face_task
+        )
+    else:
+        face_detector = None
+    return plate_detector, face_detector
+
+
+def process_video(args, plate_detector, face_detector) -> dict:
+    """Run the blur pipeline on `args.input` -> `args.output`.
+
+    Constructs the reader/writer/threads from `args`, but takes pre-built
+    detectors so callers (the batch runner) can reuse them across files. On
+    success the function returns a stats dict with `frames`, `elapsed_s`,
+    `fps`, `n_boxes_total`, and a `per_frame_ms` breakdown. Errors raise
+    instead of `sys.exit()` so the batch runner can record them in
+    `results.json` and keep going.
+    """
+    use_ffmpeg_reader = args.reader == "ffmpeg" and not str(args.input).isdigit()
     ffmpeg_reader = None  # FFmpegReader instance when use_ffmpeg_reader else None
     cap = None            # cv2.VideoCapture instance when not use_ffmpeg_reader else None
 
@@ -64,19 +95,15 @@ def main():
         print(f"[INFO] Reader: ffmpeg {'(NVDEC' if not args.no_hwaccel else '(software'}"
               f"{', transpose_in=' + transpose_in if transpose_in else ''})"
               f"  in={ffmpeg_reader.W_in}x{ffmpeg_reader.H_in}  out={W}x{H}@{fps:.2f}")
-        # ffmpeg handles the rotation on both ends; reader/writer threads do
-        # not need to rotate.
         reader_rotate, writer_rotate = None, None
         writer_inner = make_writer(args, W, H, fps, transpose_out=transpose_out)
     else:
-        cap = cv2.VideoCapture(int(args.input) if args.input.isdigit() else args.input)
+        cap = cv2.VideoCapture(int(args.input) if str(args.input).isdigit() else args.input)
         if not cap.isOpened():
-            sys.exit(f"Could not open input: {args.input}")
+            raise RuntimeError(f"Could not open input: {args.input}")
         W_raw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H_raw = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        # With --sensor, the reader thread rotates CCW for detection, and the
-        # writer thread rotates CW back to the original orientation before encoding.
         if args.sensor:
             reader_rotate, writer_rotate = "ccw", "cw"
             W, H = H_raw, W_raw  # post-rotation dimensions
@@ -121,81 +148,104 @@ def main():
         writer = _DirectWriter(writer_inner, writer_rotate)
         print("[INFO] Pipeline: single-threaded loop")
 
-    plate_detector = PlateDetectorYOLO(args.plate_weights, device, args.conf, args.imgsz,
-                                        task=args.plate_task) \
-                 if args.blur_plates else None
-
-    if args.blur_faces:
-        face_detector = FaceDetectorHaar() if args.face_detector=="haar" else FaceDetectorYOLO(
-            args.face_yolo_weights, device, args.conf, args.imgsz, task=args.face_task
-        )
-    else:
-        face_detector = None
-
     start_t = time.perf_counter()
     frames = 0
     n_boxes_total = 0
     t_read = t_plate = t_face = t_nms = t_blur = t_write = 0.0
 
-    while True:
-        t0 = time.perf_counter()
-        frame = reader.read()
-        t_read += time.perf_counter() - t0
-        if frame is None: break
-        frames += 1
-
-        boxes = []
-        if plate_detector:
+    try:
+        while True:
             t0 = time.perf_counter()
-            boxes += plate_detector(frame)
-            t_plate += time.perf_counter() - t0
-        if face_detector:
+            frame = reader.read()
+            t_read += time.perf_counter() - t0
+            if frame is None: break
+            frames += 1
+
+            boxes = []
+            if plate_detector:
+                t0 = time.perf_counter()
+                boxes += plate_detector(frame)
+                t_plate += time.perf_counter() - t0
+            if face_detector:
+                t0 = time.perf_counter()
+                boxes += face_detector(frame)
+                t_face += time.perf_counter() - t0
+
             t0 = time.perf_counter()
-            boxes += face_detector(frame)
-            t_face += time.perf_counter() - t0
+            boxes = nms_merge(boxes, iou_thresh=0.5)
+            t_nms += time.perf_counter() - t0
+            n_boxes_total += len(boxes)
 
-        t0 = time.perf_counter()
-        boxes = nms_merge(boxes, iou_thresh=0.5)
-        t_nms += time.perf_counter() - t0
-        n_boxes_total += len(boxes)
+            h_proc, w_proc = frame.shape[:2]
 
-        h_proc, w_proc = frame.shape[:2]
+            t0 = time.perf_counter()
+            for (x1,y1,x2,y2) in boxes:
+                x1,y1,x2,y2 = expand_box(x1,y1,x2,y2, args.scale, w_proc, h_proc)
+                if args.method == "gaussian":
+                    gaussian_inplace(frame, x1,y1,x2,y2, args.blur_strength)
+                else:
+                    pixelate_inplace(frame, x1,y1,x2,y2)
+            t_blur += time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        for (x1,y1,x2,y2) in boxes:
-            x1,y1,x2,y2 = expand_box(x1,y1,x2,y2, args.scale, w_proc, h_proc)
-            if args.method == "gaussian":
-                gaussian_inplace(frame, x1,y1,x2,y2, args.blur_strength)
-            else:
-                pixelate_inplace(frame, x1,y1,x2,y2)
-        t_blur += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            writer.write(frame)
+            t_write += time.perf_counter() - t0
+            if args.show:
+                cv2.imshow("privacy-blur", frame)
+                if cv2.waitKey(1) & 0xFF == 27: break
+    finally:
+        # Always tear IO down even on error, so files aren't left half-written
+        # and ffmpeg subprocesses don't linger.
+        reader.close()
+        writer.close()
+        if cap is not None:
+            cap.release()
+        if ffmpeg_reader is not None:
+            ffmpeg_reader.close()
+        if args.show: cv2.destroyAllWindows()
 
-        t0 = time.perf_counter()
-        writer.write(frame)
-        t_write += time.perf_counter() - t0
-        if args.show:
-            cv2.imshow("privacy-blur", frame)
-            if cv2.waitKey(1) & 0xFF == 27: break
-
-    reader.close()
-    writer.close()
-    if cap is not None:
-        cap.release()
-    if ffmpeg_reader is not None:
-        ffmpeg_reader.close()
-    if args.show: cv2.destroyAllWindows()
     elapsed_s = max(1e-9, time.perf_counter() - start_t)
-    fps = frames / elapsed_s
+    fps_out = frames / elapsed_s
     n = max(1, frames)
-    print(f"[STATS] Frames: {frames} | Time: {elapsed_s:.2f}s | Speed: {fps:.2f} fps")
+    per_frame_ms = {
+        "read":  t_read  / n * 1000,
+        "plate": t_plate / n * 1000,
+        "face":  t_face  / n * 1000,
+        "nms":   t_nms   / n * 1000,
+        "blur":  t_blur  / n * 1000,
+        "write": t_write / n * 1000,
+    }
+    print(f"[STATS] Frames: {frames} | Time: {elapsed_s:.2f}s | Speed: {fps_out:.2f} fps")
     print(
         f"[PROFILE] per-frame ms  "
-        f"read={t_read/n*1000:6.1f}  "
-        f"plate={t_plate/n*1000:6.1f}  "
-        f"face={t_face/n*1000:6.1f}  "
-        f"nms={t_nms/n*1000:6.1f}  "
-        f"blur={t_blur/n*1000:6.1f}  "
-        f"write={t_write/n*1000:6.1f}  "
+        f"read={per_frame_ms['read']:6.1f}  "
+        f"plate={per_frame_ms['plate']:6.1f}  "
+        f"face={per_frame_ms['face']:6.1f}  "
+        f"nms={per_frame_ms['nms']:6.1f}  "
+        f"blur={per_frame_ms['blur']:6.1f}  "
+        f"write={per_frame_ms['write']:6.1f}  "
         f"boxes/frame={n_boxes_total/n:.2f}"
     )
     print(f"[OK] Saved: {args.output}")
+
+    return {
+        "frames": frames,
+        "elapsed_s": elapsed_s,
+        "fps": fps_out,
+        "n_boxes_total": n_boxes_total,
+        "per_frame_ms": per_frame_ms,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser("Blur license plates and/or faces in video")
+    ap.add_argument("--input", required=True, help="video path or camera index, e.g. 0")
+    ap.add_argument("--output", default="out_blurred.mp4", help="output video path")
+    add_common_args(ap)
+    args = ap.parse_args()
+
+    device = choose_device(args.device)
+    print(f"[INFO] Using device: {device}")
+
+    plate_detector, face_detector = build_detectors(args, device)
+    process_video(args, plate_detector, face_detector)

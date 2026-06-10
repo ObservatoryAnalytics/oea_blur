@@ -169,3 +169,58 @@ Useful flags:
 - `--plate-task {detect, pose}` - required to match the plate model's actual task.
 - `--show` - preview window while processing.
 - `--no-blur-plates` / `--no-blur-faces` - disable individual detectors.
+
+
+## Batch processing a folder tree
+
+For automated runs across many trips, use `privacy-blur-batch`. It expects a
+work directory laid out as:
+
+```
+work_dir/
+    trip_001/
+        extracted/
+            trip_001-sensor-1.mkv
+            trip_001-sensor-2.mkv
+            trip_001-sensor-3.mkv
+            trip_001-sensor-4.mkv
+    trip_002/
+        extracted/
+            trip_002-sensor-1.mkv
+            ...
+    results.json   (created/updated by the tool)
+```
+
+Each discovered sensor file is blurred and replaced **in place** atomically
+(blurred output is written to `{name}.blur.tmp.mkv`, then `os.replace`'d onto
+the original). Models are loaded once and re-used across all files, so the
+~10 s TRT warmup is paid only once per run.
+
+```powershell
+privacy-blur-batch --work-dir D:\GSV\batch_001 ^
+    --plate-weights models/license_plate_detector.engine ^
+    --face-detector yolo --face-yolo-weights models/yolov8n-face.engine ^
+    --conf 0.35 --imgsz 1280 --device auto --sensor
+```
+
+`results.json` records the status, frame count, elapsed time, and per-stage
+ms breakdown of every job, and is updated after each file - so an
+interrupted batch resumes cleanly on the next invocation.
+
+Batch-only flags:
+
+- `--scan-only` - only discover files and update `results.json`, do not blur.
+- `--dry-run` - print what would be processed, change nothing.
+- `--force` - re-run even jobs already marked `done`.
+- `--retry-failed` - re-run jobs that previously failed.
+- `--keep-original` - keep the source as `{name}.mkv.orig` instead of overwriting.
+
+Job statuses in `results.json`: `pending` -> `running` -> `done` | `failed`.
+A run interrupted with Ctrl+C reverts the in-flight job to `pending` and
+deletes its half-written temp file before exiting.
+
+> After updating the package (e.g. pulling new code), re-install with
+> `pip install -e .` to refresh the `privacy-blur-batch` entry point.
+
+
+privacy-blur-batch --work-dir E:\NCTECH\Test_data_2 --keep-original --plate-weights models/license_plate_detector.engine --face-detector yolo --face-yolo-weights models/yolov8n-face.engine --conf 0.35 --imgsz 1280 --device auto --sensor
