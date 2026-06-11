@@ -1,10 +1,18 @@
 """Batch processing wrapper around the single-file `privacy-blur` pipeline.
 
-Scans a work directory laid out as
+Scans a work directory laid out as either:
 
     {work_dir}/
         {folder_a}/extracted/{folder_a}-sensor-{1..4}.mkv
         {folder_b}/extracted/{folder_b}-sensor-{1..4}.mkv
+        ...
+        results.json
+
+or one grouping level deeper (e.g. date -> camera -> trip):
+
+    {work_dir}/
+        {group_a}/{folder_a}/extracted/{folder_a}-sensor-{1..4}.mkv
+        {group_b}/{folder_b}/extracted/{folder_b}-sensor-{1..4}.mkv
         ...
         results.json
 
@@ -50,26 +58,46 @@ def _job_id(folder: str, sensor: int) -> str:
     return f"{folder}/sensor-{sensor}"
 
 
-def scan_folders(work_dir: Path) -> list[dict]:
-    """Discover `{folder}/extracted/{folder}-sensor-{1..4}.mkv` files.
+def _scan_trip_folder(work_dir: Path, trip_dir: Path, rel_id: str) -> list[dict]:
+    """Discover sensor files under one trip folder.
 
-    Returns one dict per existing file, in deterministic (folder, sensor)
-    order. Folders without an `extracted/` subdirectory are silently skipped.
+    Expects `{trip_dir}/extracted/{trip_dir.name}-sensor-{1..4}.mkv`.
+    `rel_id` is the path from `work_dir` to the trip folder (used for job ids).
+    """
+    jobs: list[dict] = []
+    extracted = trip_dir / "extracted"
+    if not extracted.is_dir():
+        return jobs
+    trip_name = trip_dir.name
+    for i in SENSOR_INDICES:
+        f = extracted / f"{trip_name}-sensor-{i}.mkv"
+        if f.is_file():
+            jobs.append({
+                "id": _job_id(rel_id, i),
+                "folder": rel_id,
+                "sensor": i,
+                "input": f.relative_to(work_dir).as_posix(),
+            })
+    return jobs
+
+
+def scan_folders(work_dir: Path) -> list[dict]:
+    """Discover sensor mkv files under `work_dir`.
+
+    Supports both a flat layout (`{work_dir}/{trip}/extracted/...`) and a
+    nested layout with one extra grouping level
+    (`{work_dir}/{group}/{trip}/extracted/...`). Trip folders without an
+    `extracted/` subdirectory are silently skipped.
+
+    Returns one dict per existing file, in deterministic order.
     """
     jobs: list[dict] = []
     for sub in sorted(p for p in work_dir.iterdir() if p.is_dir()):
-        extracted = sub / "extracted"
-        if not extracted.is_dir():
+        if (sub / "extracted").is_dir():
+            jobs.extend(_scan_trip_folder(work_dir, sub, sub.name))
             continue
-        for i in SENSOR_INDICES:
-            f = extracted / f"{sub.name}-sensor-{i}.mkv"
-            if f.is_file():
-                jobs.append({
-                    "id": _job_id(sub.name, i),
-                    "folder": sub.name,
-                    "sensor": i,
-                    "input": f.relative_to(work_dir).as_posix(),
-                })
+        for trip in sorted(p for p in sub.iterdir() if p.is_dir()):
+            jobs.extend(_scan_trip_folder(work_dir, trip, f"{sub.name}/{trip.name}"))
     return jobs
 
 
@@ -199,6 +227,7 @@ def main():
         description=(
             "Batch-process a work directory of sensor recordings. "
             "Looks for {work-dir}/{folder}/extracted/{folder}-sensor-{1..4}.mkv "
+            "or {work-dir}/{group}/{folder}/extracted/{folder}-sensor-{1..4}.mkv "
             "and replaces each with its blurred version in place. "
             "Progress is tracked in {work-dir}/results.json so a stopped run "
             "resumes where it left off."
