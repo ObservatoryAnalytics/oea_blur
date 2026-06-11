@@ -222,5 +222,8 @@ deletes its half-written temp file before exiting.
 > After updating the package (e.g. pulling new code), re-install with
 > `pip install -e .` to refresh the `privacy-blur-batch` entry point.
 
-
+### Keep original
 privacy-blur-batch --work-dir E:\NCTECH\Test_data_2 --keep-original --plate-weights models/license_plate_detector.engine --face-detector yolo --face-yolo-weights models/yolov8n-face.engine --conf 0.35 --imgsz 1280 --device auto --sensor
+
+### Over write original
+privacy-blur-batch --work-dir "E:\NCTECH\18th April" --plate-weights models/license_plate_detector.engine --face-detector yolo --face-yolo-weights models/yolov8n-face.engine --conf 0.35 --imgsz 1280 --device auto --sensor
